@@ -1,0 +1,11 @@
+{
+  "name": "ocsp",
+  "description": "",
+  "version": "0.1.0",
+  "dependencies": {},
+  "devDependencies": {
+    "serverless-domain-manager": "^2.2.2",
+    "serverless-plugin-custom-binary": "^1.1.0",
+    "serverless-python-requirements": "^3.3.0"
+  }
+}
