@@ -44,3 +44,4 @@ node_modules/
 # Sensitive x509 Information
 *.pfx
 *.pem
+*.der

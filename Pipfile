@@ -8,6 +8,8 @@ name = "pypi"
 [packages]
 
 ocspbuilder = "*"
+pynamodb = "*"
+certvalidator = "*"
 
 
 [dev-packages]

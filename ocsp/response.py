@@ -1,6 +1,6 @@
 import logging
 import base64
-import enum
+from enum import Enum
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Tuple, Optional, Union
 
@@ -10,35 +10,19 @@ from oscrypto import asymmetric
 from ocspbuilder import OCSPResponseBuilder
 
 from .util import _type_name, _pretty_message
-
+from .model import CertificateStatus
 
 logger = logging.getLogger(__name__)
 
-
 # Enums
 
-class ResponseStatus(enum.Enum):
+class ResponseStatus(Enum):
     successful = 'successful'
     malformed_request = 'malformed_request'
     internal_error = 'internal_error'
     try_later = 'try_later'
     sign_required = 'sign_required'
     unauthorized = 'unauthorized'
-
-
-class CertificateStatus(enum.Enum):
-    good = 'good'
-    revoked = 'revoked'
-    key_compromise = 'key_compromise'
-    ca_compromise = 'ca_compromise'
-    affiliation_changed = 'affiliation_changed'
-    superseded = 'superseded'
-    cessation_of_operation = 'cessation_of_operation'
-    certificate_hold = 'certificate_hold'
-    remove_from_crl = 'remove_from_crl'
-    privilege_withdrawn = 'privilege_withdrawn'
-    unknown = 'unknown'
-
 
 # Types
 
@@ -47,9 +31,9 @@ PrivateKey = Union[keys.PrivateKeyInfo, asymmetric.PrivateKey]
 Certificate = Union[x509.Certificate, asymmetric.Certificate]
 
 ValidateFuncRet = Tuple[CertificateStatus, Optional[datetime]]
-ValidateFunc = Callable[[int, bytes, bytes, x509.Certificate], ValidateFuncRet]
+ValidateFunc = Callable[[CertId, x509.Certificate], ValidateFuncRet]
 CertRetrieveFuncRet = Union[str, asymmetric.Certificate, x509.Certificate]
-CertRetrieveFunc = Callable[[int, bytes, bytes, x509.Certificate], CertRetrieveFuncRet]
+CertRetrieveFunc = Callable[[CertId, x509.Certificate], CertRetrieveFuncRet]
 
 
 # Methods
@@ -70,6 +54,19 @@ def _get_req_cert_id(ocsp_request: OCSPRequest) -> CertId:
 
     return req_cert_id
 
+def _generate_mock_cert(req_cert_id: CertId, issuer_cert: Certificate) -> CertRetrieveFuncRet:
+    serial_num = req_cert_id['serial_number'].native
+
+    tbs_cert = x509.TbsCertificate({
+        'version': 'v3',
+        'serial_number': serial_num,
+        'issuer': issuer_cert.subject,
+    })
+    cert = x509.Certificate({
+        'tbs_certificate': tbs_cert
+    })
+    return cert
+
 # API classes
 
 class OCSPResponder:
@@ -77,7 +74,7 @@ class OCSPResponder:
     _issuer_cert = None
 
     def __init__(self, issuer_cert: Certificate, responder_cert: Certificate, responder_key: PrivateKey,
-                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc,
+                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc = None,
                        next_update_days: int = 7):
         """
         Create a new OCSPResponder instance.
@@ -101,14 +98,14 @@ class OCSPResponder:
 
         # Functions
         self._validate = validate_func
-        self._cert_retrieve = cert_retrieve_func
+        self._cert_retrieve = cert_retrieve_func or _generate_mock_cert
 
         # Next update
         self._next_update_days = next_update_days
 
     @classmethod
     def frompfx(cls, responder_pkcs12: StrOrBytes, pkcs12_password: StrOrBytes,
-                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc,
+                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc = None,
                        next_update_days: int = 7):
         """
         Create a new OCSPResponder instance from a pkcs12 filepath or bytes.
@@ -137,7 +134,7 @@ class OCSPResponder:
 
     @classmethod
     def frompem(cls, issuer_cert: StrOrBytes, responder_cert: StrOrBytes, responder_key: StrOrBytes,
-                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc,
+                       validate_func: ValidateFunc, cert_retrieve_func: CertRetrieveFunc = None,
                        next_update_days: int = 7):
         """
         Create a new OCSPResponder instance from filepaths or bytes.
@@ -165,7 +162,7 @@ class OCSPResponder:
                 next_update_days=next_update_days)
 
     @property
-    def issuer_dname(self) -> x509.Name:
+    def issuer_name(self) -> x509.Name:
         return self._issuer_cert.subject
 
     @property
@@ -296,8 +293,10 @@ class OCSPResponders:
 
     def add(self, responder: OCSPResponder) -> OCSPResponder:
         for key_hash_algo in ['sha1', 'sha256']:
-            k = getattr(responder.issuer_public_key, key_hash_algo)
-            self._responders[k] = responder
+            issuer_key_hash = getattr(responder.issuer_public_key, key_hash_algo)
+            self._responders[issuer_key_hash] = responder
+            issuer_name_hash = getattr(responder.issuer_name, key_hash_algo)
+            self._responders[issuer_name_hash] = responder
 
         return responder
 
@@ -321,13 +320,18 @@ class OCSPResponders:
             logger.exception('Could not parse OCSPRequest: %s', e)
             return _fail(ResponseStatus.malformed_request)
         else:
-            try:
-                issuer_key_hash = req_cert_id['issuer_key_hash'].native
-            except ValueError as e:
+            responder = None
+            for attr in ['issuer_key_hash', 'issuer_name_hash']:
+                try:
+                    h = req_cert_id[attr].native
+                    if h in self._responders:
+                        responder = self._responders[h]
+                        break
+                except (ValueError, KeyError):
+                    pass
+
+            if not responder:
                 responder = self.default_responder
-            else:
-                # Get the correct responder for the request
-                responder = self._responders.get(issuer_key_hash)
 
             if responder:
                 return responder.build_ocsp_response(ocsp_request)

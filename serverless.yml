@@ -25,13 +25,9 @@ provider:
   stage: dev
   memorySize: 128
   environment:
-    ISSUER_COUNT: '2'
-    OCSP_PFX_1: 'certs/ocsp1.pfx'
-    OCSP_PFX_PASS_1: 'rahasia123456'
-    DYNAMODB_TABLE_1: ${self:service}-${opt:stage, self:provider.stage}
-    OCSP_PFX_2: 'certs/ocsp2.pfx'
-    OCSP_PFX_PASS_2: '123456'
-    DYNAMODB_TABLE_2: ${self:service}-${opt:stage, self:provider.stage}
+    DYNAMODB_REGION: ${opt:region, self:provider.region}
+    DYNAMODB_TABLE: ${self:service}-${opt:stage, self:provider.stage}
+    DYNAMODB_DATETIME_FORMAT: '%Y-%m-%dT%H:%M:%S.%f%z'
   iamRoleStatements:
     - Effect: Allow
       Action:
@@ -41,7 +37,16 @@ provider:
         - dynamodb:PutItem
         - dynamodb:UpdateItem
         - dynamodb:DeleteItem
-      Resource: "arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.DYNAMODB_TABLE_1}"
+        - dynamodb:DescribeTable
+      Resource: "arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.DYNAMODB_TABLE}"
+    - Effect: "Allow"
+      Action:
+        - "s3:GetObject"
+      Resource: "arn:aws:s3:::${self:custom.s3_bucket}/${self:custom.s3_key_base}*"
+    - Effect: "Allow"
+      Action:
+        - "s3:PutBucketNotification"
+      Resource: "arn:aws:s3:::${self:custom.s3_bucket}"
 
 # you can overwrite defaults here
 #  stage: dev
@@ -77,6 +82,7 @@ provider:
 #    - exclude-me-dir/**
 
 package:
+  excludeDevDependencies: true
   exclude:
     - .gitignore
     - .git/**
@@ -90,12 +96,24 @@ package:
     - requirements.txt
     - Pipfile
     - Pipfile.lock
+    - '**.dist-info/**'
+    - LICENSE
+
 
 functions:
   respond:
     description: Online Certificate Status Protocol via HTTP GET / POST
     handler: handler.respond
     timeout: 15
+    environment:
+      # OCSP_COUNT should denote the total number of OCSP responders (in-case of serving intermediate-CAs)
+      OCSP_COUNT: '2'
+      # PFX files should contain ocsp signer's privKey (and all related certificates in the chain)
+      OCSP_PFX_1: 'config/ocsp1.pfx'
+      OCSP_PFX_PASS_1: 'rahasia123456'
+      # 2nd OCSP Responder/Signer
+      OCSP_PFX_2: 'config/ocsp2.pfx'
+      OCSP_PFX_PASS_2: '123456'
     events:
       - http:
           path: /{request_b64}
@@ -107,15 +125,31 @@ functions:
           method: post
           cors: true
           contentHandling: CONVERT_TO_BINARY
-  # post:
-  #   description: Online Certificate Status Protocol via HTTP POST
-  #   handler: handler.respond
-  #   timeout: 30
-  #   events:
-  #     - http:
-  #         path: /
-  #         method: post
-  #         cors: true
+  bucket:
+    handler: bucket.event
+    description: Called by s3 create/remove events to manage certificate state in DynamoDB
+    timeout: 60
+    environment:
+      # One or many Root certificates in PEM-format to validate the certificates before being registered into OCSP
+      TRUST_ROOTS: 'config/root_bundle.pem'
+    events:
+      - existingS3:
+          bucket: ${self:custom.s3_bucket}
+          event:
+            - s3:ObjectCreated:*
+            - s3:ObjectRemoved:*
+          rules:
+            - prefix: ${self:custom.s3_key_base}
+      # - s3:
+      #     bucket: ${self:custom.s3_bucket}
+      #     event: s3:ObjectCreated:*
+      #     rules:
+      #       - prefix: ${self:custom.s3_key_base}
+      # - s3:
+      #     bucket: ${self:custom.s3_bucket}
+      #     event: s3:ObjectRemoved:*
+      #     rules:
+      #       - prefix: ${self:custom.s3_key_base}
 
 #    The following are a few example events you can configure
 #    NOTE: Please make sure to change your handler code to work with those events
@@ -170,16 +204,16 @@ resources:
       Properties:
         AttributeDefinitions:
           -
-            AttributeName: id
+            AttributeName: uid
             AttributeType: S
         KeySchema:
           -
-            AttributeName: id
+            AttributeName: uid
             KeyType: HASH
         ProvisionedThroughput:
           ReadCapacityUnits: 1
           WriteCapacityUnits: 1
-        TableName: ${self:provider.environment.DYNAMODB_TABLE_1}
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
 
 custom:
   pythonRequirements:
@@ -194,15 +228,21 @@ custom:
     endpointType: 'regional'
   apigatewayBinary:
     types:
-      - '*/*'
+      - 'application/ocsp-request'  # request content-type-header
+      - '*/*'                       # request accept-header
       #- 'application/json'
       #- 'image/jpeg'
-      # list of mime-types (matches accept header for request, and content-type header for response)
-      # https://medium.com/nextfaze/binary-responses-with-serverless-framework-and-api-gateway-5fde91376b76
+      # list of mime-types (matches request content-type-header for request-body, and matches request accept-header for response-body)
+      # Read carefully: https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-payload-encodings.html
+      # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-payload-encodings-workflow.html
+  s3_bucket: lmu-pki
+  s3_key_base: certs/
 
 plugins:
   - serverless-python-requirements
   - serverless-domain-manager
   - serverless-plugin-custom-binary
+  - serverless-plugin-existing-s3
+  # https://medium.com/nextfaze/binary-responses-with-serverless-framework-and-api-gateway-5fde91376b76
   #- serverless-apigateway-plugin 
-  #- serverless-apigwy-binary 
+  #- serverless-apigwy-binary

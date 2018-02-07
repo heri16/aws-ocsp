@@ -6,6 +6,7 @@
   "devDependencies": {
     "serverless-domain-manager": "^2.2.2",
     "serverless-plugin-custom-binary": "^1.1.0",
+    "serverless-plugin-existing-s3": "^2.0.3",
     "serverless-python-requirements": "^3.3.0"
   }
 }

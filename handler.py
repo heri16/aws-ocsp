@@ -1,62 +1,94 @@
 import os
-import json
 import base64
-import logging
 from urllib.parse import unquote
-from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
+from botocore.exceptions import ClientError
 import boto3
 dynamodb = boto3.resource('dynamodb')
 
+from asn1crypto import pem
+
 from ocsp.http import parse_ocsp_request, http_ocsp_response
-from ocsp.response import OCSPResponders, CertificateStatus
+from ocsp.response import OCSPResponders
+from ocsp.model import CertificateStatus
 
 from ocsp import CertId, Certificate
 from ocsp import ValidateFuncRet, CertRetrieveFuncRet
 
-ISSUER_COUNT = int(os.environ['ISSUER_COUNT'])
+from log_cfg import logger
+
+
+OCSP_COUNT = int(os.environ['OCSP_COUNT'])
+
+DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE')
+DYNAMODB_DATETIME_FORMAT = os.environ.get('DYNAMODB_DATETIME_FORMAT', '%Y-%m-%dT%H:%M:%S.%f%z')
 
 responders = OCSPResponders()
-for i in range(1, ISSUER_COUNT+1):
+for i in range(1, OCSP_COUNT+1):
     ocsp_pfx = os.environ['OCSP_PFX_{}'.format(i)]
-    ocsp_pfx_password = os.environ['OCSP_PFX_PASS_{}'.format(i)]
+    ocsp_pfx_password = os.environ.get('OCSP_PFX_PASS_{}'.format(i), None)
+    ocsp_days = os.environ.get('OCSP_DAYS_{}'.format(i), 1)
 
     # Each issuer should have a unique dynamodb lookup table
-    table = os.environ.get('DYNAMODB_TABLE_{}'.format(i))
+    table = os.environ.get('DYNAMODB_TABLE_{}'.format(i)) or DYNAMODB_TABLE
 
     r = responders.add_frompfx(
         ocsp_pfx, ocsp_pfx_password,
         validate_func=(lambda cid, issuer_cert, table=table: validate_cert(cid, issuer_cert, table)),
-        cert_retrieve_func=(lambda cid, issuer_cert, table=table: get_cert(cid, issuer_cert, table)),
+        #cert_retrieve_func=(lambda cid, issuer_cert, table=table: get_cert(cid, issuer_cert, table)),
+        next_update_days=ocsp_days,
     )
-
-OCSP_DEFAULT_REQUEST = 'MG8wbTBGMEQwQjAJBgUrDgMCGgUABBQYEy+ej9QcS4v1YlHWNbL0fh+cngQUfqTT8lJftqDD3fV+PTbQlG4K+74CCQClAUsjbsYHoqIjMCEwHwYJKwYBBQUHMAECBBIEENM9dTSRus0yJWyK3m2s+fg='
 
 def validate_cert(req_cert_id: CertId, issuer_cert: Certificate, lookup_table: str = None) -> ValidateFuncRet:
     """
-    Assume the certificates are stored in DynamoDB Table with the
-    serial as the lookup key.
+    The certificate records are stored in DynamoDB Table with the
+    the lookup key of '<cert_authority_key_id_hex>:<cert_serial_hex>'.
     """
-    # table = dynamodb.Table(lookup_table)
-    # fetch todo from the database
-    # result = table.get_item(
-    #     Key={
-    #         'id': event['pathParameters']['id']
-    #     }
-    # )
+    if not lookup_table:
+        return (CertificateStatus.unknown, None)
+    else:
+        table = dynamodb.Table(lookup_table)
 
-    serial = req_cert_id['serial_number'].native
-    issuer_key_hash = req_cert_id['issuer_key_hash'].native
-    issuer_name_hash = req_cert_id['issuer_name_hash'].native
-    hash_algorithm = req_cert_id['hash_algorithm']
-    hash_algo_name = hash_algorithm['algorithm'].native
+        cert_serial_num = req_cert_id['serial_number'].native
+        cert_serial_hex = hex(cert_serial_num)[2:]
+        cert_authority_key_id_hex = issuer_cert.key_identifier.hex()
+
+        try:
+            # fetch cert record from the database
+            response = table.get_item(
+                Key={
+                    'uid': '{}:{}'.format(cert_authority_key_id_hex, cert_serial_hex)
+                }
+            )
+        except ClientError as e:
+            logger.exception(e.response['Error']['Message'])
+            return (CertificateStatus.unknown, None)
+        else:
+            if not 'Item' in response:
+                return (CertificateStatus.unknown, None)
+
+            item = response['Item']
+            logger.info("DynamoDB GetItem succeeded: %s", item)
+
+            status = item.get('status')
+            revokedAt = item.get('revokedAt') 
+            if revokedAt:
+                dt = datetime.strptime(revokedAt, DYNAMODB_DATETIME_FORMAT)
+                return (CertificateStatus[status], dt)
+            else:
+                return (CertificateStatus[status], None)
+
+    #serial = req_cert_id['serial_number'].native
+    #issuer_key_hash = req_cert_id['issuer_key_hash'].native
+    #issuer_name_hash = req_cert_id['issuer_name_hash'].native
+    #hash_algorithm = req_cert_id['hash_algorithm']
+    #hash_algo_name = hash_algorithm['algorithm'].native
     #hash_algo_params = hash_algorithm['parameters'].native
 
-    return (CertificateStatus.good, None)
+    #return (CertificateStatus.unknown, None)
+    #revoked_time = datetime(2015, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    #return (CertificateStatus.key_compromise, revoked_time)
 
     # if certificate_is_valid(serial):
     #     return (CertificateStatus.good, None)
@@ -69,30 +101,6 @@ def validate_cert(req_cert_id: CertId, issuer_cert: Certificate, lookup_table: s
     # else:
     #     return (CertificateStatus.unknown, None)
 
-def get_cert(req_cert_id: CertId, issuer_cert: Certificate, lookup_table: str = None) -> CertRetrieveFuncRet:
-    """
-    Assume the certificates are stored in DynamoDB Table with the
-    serial as the lookup key.
-    """
-    # table = dynamodb.Table(lookup_table)
-
-    serial = req_cert_id['serial_number'].native
-
-    from asn1crypto import x509
-
-    tbs_cert = x509.TbsCertificate({
-        'version': 'v3',
-        'serial_number': serial,
-        'issuer': issuer_cert.subject,
-    })
-    cert = x509.Certificate({
-        'tbs_certificate': tbs_cert
-    })
-    return cert
-
-    #with open('certs/yulia.cer', 'r') as f:
-    #    return f.read().strip()
-
 
 def respond(event: dict, context) -> dict:
     """
@@ -101,11 +109,12 @@ def respond(event: dict, context) -> dict:
     An OCSP POST request contains the DER encoded OCSP request in the HTTP
     request body.
     """
-    logger.debug("Lambda Event: %s", event)
+    logger.debug("APIGW event: %s", event)
 
     http_method = event.get('httpMethod')
     if not http_method:
-        der = base64.b64decode(OCSP_DEFAULT_REQUEST)
+        with open('config/sample-ocsp-request.txt', 'r') as f:
+            der = base64.b64decode(f.read().strip())
     elif http_method == 'GET':
         request_param = event['pathParameters'].get('request_b64')
         request_data = unquote(request_param)
@@ -133,5 +142,9 @@ def respond(event: dict, context) -> dict:
         ocsp_response_data = ocsp_response.response_data
         for single_response in ocsp_response_data['responses']:
             logger.info("Certificate Revocation Status: %s", single_response['cert_status'].name)
+            logger.info("OCSP Next Update: %s", single_response['next_update'].native)
 
-    return http_ocsp_response(ocsp_response)
+    response = http_ocsp_response(ocsp_response, max_age=43200)
+    logger.debug("APIGW Response: %s", response)
+    return response
+
